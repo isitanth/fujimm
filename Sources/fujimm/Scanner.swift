@@ -5,7 +5,13 @@ struct MediaItem {
     var filename: String
     var ext: String
     var kind: MediaKind
+    /// Size of the bytes that will actually be copied — for a symlink, the
+    /// target's size, because `Copier` opens through the link.
     var size: Int64
+    /// Modification time of those same bytes. Carried so the copier can decide
+    /// whether a destination file is this file without a second stat. Distinct
+    /// from `date`, which is the *capture* date and for a still comes from EXIF.
+    var mtime: Date
     var date: ResolvedDate
     /// Destination relative to the destination root, e.g. "2026-06-15/Photos/DSCF6810.RAF"
     var relativeDestination: String
@@ -30,14 +36,25 @@ struct Scanner {
     let options: Options
     let resolver: DateResolver
 
+    /// Requested once from the enumerator and read from the cache thereafter.
+    /// Asking for a key and then not reading it costs a stat per file for
+    /// nothing, which is what the previous `attributesOfItem` call did.
+    private static let prefetchedKeys: Set<URLResourceKey> = [
+        .isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey,
+        .fileSizeKey, .contentModificationDateKey, .creationDateKey,
+    ]
+
     func scan(card: Card) -> ScanResult {
         var result = ScanResult()
         let fm = FileManager.default
 
         guard let walker = fm.enumerator(
             at: card.dcimURL,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .isDirectoryKey],
-            options: [],
+            includingPropertiesForKeys: Array(Self.prefetchedKeys),
+            // A bundle is opaque: descending into a .photoslibrary sitting in a
+            // --source tree would flatten its internals into the import as
+            // loose photos.
+            options: [.skipsPackageDescendants],
             errorHandler: { url, err in
                 result.unreadable.append((url, err.localizedDescription))
                 return true  // keep going; one bad folder must not abort the import
@@ -47,9 +64,16 @@ struct Scanner {
         while let url = walker.nextObject() as? URL {
             let name = url.lastPathComponent
 
+            // One read of the values the enumerator already prefetched, rather
+            // than a resourceValues call for the directory test plus a separate
+            // stat for size and mtime.
+            guard let values = try? url.resourceValues(forKeys: Self.prefetchedKeys) else {
+                result.unreadable.append((url, "could not read attributes"))
+                continue
+            }
+
             // Prune camera-internal and OS bookkeeping directories entirely.
-            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-            if isDir {
+            if values.isDirectory == true {
                 if Formats.ignoredDirectories.contains(name.uppercased()) || name.hasPrefix(".") {
                     walker.skipDescendants()
                 }
@@ -82,11 +106,27 @@ struct Scanner {
                 continue
             }
 
-            guard let attrs = try? fm.attributesOfItem(atPath: url.path) else {
-                result.unreadable.append((url, "could not read attributes"))
-                continue
+            // A symlink's own values describe the link — its size is the length
+            // of the path it holds — while `Copier` opens through it with
+            // O_RDONLY and copies the target. Describe what will be copied.
+            let stat: URLResourceValues
+            if values.isSymbolicLink == true {
+                guard let target = try? url.resolvingSymlinksInPath()
+                    .resourceValues(forKeys: Self.prefetchedKeys) else {
+                    result.unreadable.append((url, "broken symlink"))
+                    continue
+                }
+                stat = target
+            } else {
+                stat = values
             }
-            let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+
+            let size = Int64(stat.fileSize ?? 0)
+            let mtime = stat.contentModificationDate ?? Date()
+
+            var attrs: [FileAttributeKey: Any] = [:]
+            if let m = stat.contentModificationDate { attrs[.modificationDate] = m }
+            if let c = stat.creationDate { attrs[.creationDate] = c }
 
             let date = resolver.resolve(url: url, kind: kind, attributes: attrs)
 
@@ -107,6 +147,7 @@ struct Scanner {
                 ext: ext.uppercased(),
                 kind: kind,
                 size: size,
+                mtime: mtime,
                 date: date,
                 relativeDestination: rel
             ))
