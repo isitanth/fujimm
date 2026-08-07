@@ -1,6 +1,6 @@
-# fujimm
+# fujimm (fuji media manager)
 
-Sort a Fujifilm card into per-day folders. One command, read-only, no library.
+Current feature is to sort a Fujifilm card into per-day folders over a simple CLI command.
 
 ```
 fujimm
@@ -10,7 +10,7 @@ fujimm
 
 ## Why
 
-A Fujifilm card hands you one flat folder:
+A Fujifilm card places everything at one flat folder:
 
 ```
 /Volumes/Untitled/DCIM/100_FUJI/
@@ -18,7 +18,7 @@ A Fujifilm card hands you one flat folder:
 ```
 
 Two hundred files named after a counter, six weeks of shooting, stills and clips
-interleaved. Nothing in that folder tells you which day is which.
+mixed.
 
 The obvious ways out are all slightly wrong:
 
@@ -30,10 +30,9 @@ The obvious ways out are all slightly wrong:
   Finder's *Date Created* is not the capture date, and it silently writes 18
   `._DSCF*` AppleDouble stubs onto your card the moment you open it.
 
-What you actually want is boring: the same files, on your disk, in folders named
-after the day you shot them. That is all this does.
+It was boring for me and needed a simple cleaner and non-destructive solution.
 
-## The result
+## The outcome
 
 ```console
 $ fujimm
@@ -106,15 +105,7 @@ fujimm --source ~/old-offload            # re-sort a folder you already copied
 
 `fujimm --help` lists everything.
 
-## How
-
-Three decisions carry the whole tool.
-
-**The day comes from the camera, not the filesystem.** Stills are dated by EXIF
-`DateTimeOriginal`, read literally with no timezone conversion — if the camera
-said 15 June, the file lands in `2026-06-15` no matter where you have since
-flown. Fallback order is `DateTimeOriginal` → `DateTimeDigitized` → TIFF
-`DateTime` → modification time, and `--verbose` prints which one was used.
+## Context
 
 **Videos are dated by modification time, on purpose.** Fujifilm cards are exFAT,
 which stores wall-clock time, so mtime reproduces the camera's own clock and
@@ -124,7 +115,7 @@ of 06:12:38 — an hour out, enough to push a late-evening clip onto the wrong d
 `--video-date quicktime` switches to it anyway for footage that has been through
 other software.
 
-*Checked on a real X-T5 card: across all 223 RAF files, the EXIF day and the
+*Tested on a real X-T5 card: across all 223 RAF files, the EXIF day and the
 modification-time day agreed on every single one.*
 
 **The card is read-only, structurally.** Sources are opened `O_RDONLY`; there is
