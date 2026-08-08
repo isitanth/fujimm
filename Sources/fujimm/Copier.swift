@@ -42,20 +42,40 @@ final class Copier {
         var dest = root.appendingPathComponent(item.relativeDestination)
         let fm = FileManager.default
 
-        if options.dryRun {
-            // Still report the collision decision so a dry run predicts reality.
+        var didOverwrite = false
+        var didRename = false
+
+        // Where this file goes. Decided once, before the dry-run branch, so a
+        // dry run cannot predict something the real run will not do.
+        if options.overwrite {
             if fm.fileExists(atPath: dest.path) {
-                if isAlreadyImported(source: item.source, dest: dest, size: item.size) {
+                // Replacing a file with itself is pointless I/O, so an identical
+                // copy is still skipped even when --overwrite was asked for.
+                if identity(of: item, matches: dest) == .identical {
                     return CopyRecord(item: item, outcome: .skippedIdentical, destination: dest)
                 }
-                if options.overwrite {
-                    return CopyRecord(item: item, outcome: .wouldCopy, destination: dest)
-                }
-                let alt = uniqueDestination(dest)
-                if alt != dest {
-                    return CopyRecord(item: item, outcome: .renamed(to: alt.lastPathComponent),
-                                      destination: alt)
-                }
+                didOverwrite = true
+            }
+        } else {
+            switch placement(of: item, at: dest) {
+            case .existing(let url):
+                return CopyRecord(item: item, outcome: .skippedIdentical, destination: url)
+            case .fresh(let url):
+                didRename = url != dest
+                dest = url
+            case .exhausted:
+                return CopyRecord(
+                    item: item,
+                    outcome: .failed("\(item.filename): all 9999 -N name slots are taken"),
+                    destination: dest
+                )
+            }
+        }
+
+        if options.dryRun {
+            if didRename {
+                return CopyRecord(item: item, outcome: .renamed(to: dest.lastPathComponent),
+                                  destination: dest)
             }
             return CopyRecord(item: item, outcome: .wouldCopy, destination: dest)
         }
@@ -69,28 +89,14 @@ final class Copier {
                               destination: dest)
         }
 
-        var didOverwrite = false
-        var didRename = false
-
-        if fm.fileExists(atPath: dest.path) {
-            if isAlreadyImported(source: item.source, dest: dest, size: item.size) {
-                return CopyRecord(item: item, outcome: .skippedIdentical, destination: dest)
-            }
-            if options.overwrite {
-                didOverwrite = true
-            } else {
-                let alt = uniqueDestination(dest)
-                // uniqueDestination also detects an existing identical `-1` copy
-                if alt == dest {
-                    return CopyRecord(item: item, outcome: .skippedIdentical, destination: dest)
-                }
-                dest = alt
-                didRename = true
-            }
-        }
-
         // Write to a sibling temp file and rename into place, so an interrupted
         // run can never leave a truncated file wearing the real name.
+        //
+        // The name derives from the *source* filename, not from `dest`, so two
+        // sources colliding into one directory share a temp path. That is safe
+        // only because this loop is serial and the first temp is renamed away
+        // before the second starts. Putting N files in flight (imp-copy-overlap)
+        // makes it a live corruption bug — key the name on `dest` first.
         let temp = dest.deletingLastPathComponent()
             .appendingPathComponent(".fujimm-\(ProcessInfo.processInfo.processIdentifier)-\(item.filename).part")
 
@@ -127,12 +133,19 @@ final class Copier {
 
             // Carry the camera's timestamps onto the copy so the sorted tree
             // still sorts by capture time in Finder.
-            if let attrs = try? fm.attributesOfItem(atPath: item.source.path) {
-                var keep: [FileAttributeKey: Any] = [:]
-                if let m = attrs[.modificationDate] { keep[.modificationDate] = m }
-                if let c = attrs[.creationDate] { keep[.creationDate] = c }
-                try? fm.setAttributes(keep, ofItemAtPath: temp.path)
+            //
+            // The modification time comes from `item`, not from a fresh stat of
+            // the source: Scanner already resolved it through any symlink, and
+            // re-stat'ing here with attributesOfItem would not. It also makes
+            // `identity(of:matches:)` sound by construction — a copy this tool
+            // wrote always carries exactly the mtime it will later compare.
+            var keep: [FileAttributeKey: Any] = [.modificationDate: item.mtime]
+            if let attrs = try? fm.attributesOfItem(
+                atPath: item.source.resolvingSymlinksInPath().path
+            ), let created = attrs[.creationDate] {
+                keep[.creationDate] = created
             }
+            try? fm.setAttributes(keep, ofItemAtPath: temp.path)
 
             do {
                 if didOverwrite && fm.fileExists(atPath: dest.path) {
@@ -222,37 +235,106 @@ final class Copier {
 
     // MARK: - Duplicate / collision handling
 
-    /// A file already at the destination counts as imported when the sizes match.
-    /// With --verify we go further and compare content before skipping.
-    private func isAlreadyImported(source: URL, dest: URL, size: Int64) -> Bool {
-        guard sameSize(dest, size) else { return false }
-        guard options.verify else { return true }
-        guard let a = sha256(of: source), let b = sha256(of: dest) else { return false }
-        return a == b
+    private enum FileIdentity {
+        case identical
+        case different
     }
 
-    private func sameSize(_ url: URL, _ size: Int64) -> Bool {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let existing = (attrs[.size] as? NSNumber)?.int64Value else { return false }
-        return existing == size
+    private enum Placement {
+        /// An identical copy is already here. Nothing to do.
+        case existing(URL)
+        /// Write here. Equals the base path when nothing was in the way.
+        case fresh(URL)
+        /// All 9999 slots are taken. A hard failure — never a silent skip.
+        case exhausted
     }
 
-    /// Produce `DSCF6810-1.RAF`, `-2`, … Returns the original URL unchanged if an
-    /// existing numbered copy already holds the same bytes (nothing to do).
-    private func uniqueDestination(_ url: URL) -> URL {
+    /// exFAT stores modification time at 2-second granularity, so a destination
+    /// on an exFAT archive drive rounds the timestamp we wrote. Comparing
+    /// exactly would call every file different and re-duplicate the whole
+    /// archive on the next run.
+    private static let mtimeTolerance: TimeInterval = 2
+
+    /// Head and tail window for the content sample.
+    private static let sampleWindow = 64 * 1024
+
+    /// Is `dest` provably the same file as `item`'s source?
+    ///
+    /// Asymmetric on purpose. `.identical` means "do not copy", which destroys a
+    /// photograph if it is wrong, so it is returned only on positive proof.
+    /// Anything unreadable, missing or ambiguous answers `.different`, which
+    /// costs at worst one redundant `-N` copy.
+    private func identity(of item: MediaItem, matches dest: URL) -> FileIdentity {
+        guard let values = try? dest.resolvingSymlinksInPath()
+                .resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              let size = values.fileSize,
+              Int64(size) == item.size
+        else { return .different }
+
+        if let m = values.contentModificationDate,
+           abs(m.timeIntervalSince(item.mtime)) > Self.mtimeTolerance {
+            return .different
+        }
+
+        // Size and mtime alone cannot separate two distinct frames: the
+        // tolerance above is wide enough to cover a burst, where several frames
+        // share one 2-second tick, and uncompressed RAF is a fixed size for a
+        // given body. The content check is what makes the tolerance safe.
+        if options.verify {
+            guard let a = sha256(of: item.source), let b = sha256(of: dest) else { return .different }
+            return a == b ? .identical : .different
+        }
+        guard let a = sample(item.source, size: item.size),
+              let b = sample(dest, size: item.size)
+        else { return .different }
+        return a == b ? .identical : .different
+    }
+
+    /// SHA-256 over the first and last 64 KB. Two distinct frames always differ
+    /// inside the first window — EXIF `DateTimeOriginal` and the embedded
+    /// thumbnail both live there — and the tail catches a truncated copy.
+    private func sample(_ url: URL, size: Int64) -> String? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+
+        var hasher = SHA256()
+        if size <= Int64(Self.sampleWindow) * 2 {
+            guard let all = try? fh.readToEnd() else { return nil }
+            hasher.update(data: all)
+        } else {
+            guard let head = try? fh.read(upToCount: Self.sampleWindow) else { return nil }
+            hasher.update(data: head)
+            do { try fh.seek(toOffset: UInt64(size - Int64(Self.sampleWindow))) } catch { return nil }
+            guard let tail = try? fh.read(upToCount: Self.sampleWindow) else { return nil }
+            hasher.update(data: tail)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Walk `base`, `base-1`, `base-2`, … and stop at the first candidate that
+    /// either already holds these bytes or does not exist.
+    ///
+    /// This is one function rather than two on purpose. "Has this already been
+    /// imported?" and "which `-N` should it become?" are the same question asked
+    /// at `i = 0` and `i > 0`, and answering them with two different predicates
+    /// is what let a frame be dropped at the base path while re-runs piled up
+    /// duplicates behind it.
+    private func placement(of item: MediaItem, at base: URL) -> Placement {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: url.path) else { return url }
+        if !fm.fileExists(atPath: base.path) { return .fresh(base) }
+        if identity(of: item, matches: base) == .identical { return .existing(base) }
 
-        let dir = url.deletingLastPathComponent()
-        let base = url.deletingPathExtension().lastPathComponent
-        let ext = url.pathExtension
+        let dir = base.deletingLastPathComponent()
+        let stem = base.deletingPathExtension().lastPathComponent
+        let ext = base.pathExtension
 
         for i in 1...9999 {
-            let name = ext.isEmpty ? "\(base)-\(i)" : "\(base)-\(i).\(ext)"
+            let name = ext.isEmpty ? "\(stem)-\(i)" : "\(stem)-\(i).\(ext)"
             let candidate = dir.appendingPathComponent(name)
-            if !fm.fileExists(atPath: candidate.path) { return candidate }
+            if !fm.fileExists(atPath: candidate.path) { return .fresh(candidate) }
+            if identity(of: item, matches: candidate) == .identical { return .existing(candidate) }
         }
-        return url
+        return .exhausted
     }
 
     private func sha256(of url: URL) -> String? {
