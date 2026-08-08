@@ -207,12 +207,25 @@ if !options.dryRun {
     let probe = FileManager.default.fileExists(atPath: destParent.path)
         ? destParent
         : destParent.deletingLastPathComponent()
-    if let v = try? probe.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-       let free = v.volumeAvailableCapacityForImportantUsage,
-       free < totalBytes {
-        Term.err("\(Term.red("error:")) not enough space at \(options.destination.path).")
-        Term.err("  need \(Fmt.bytes(totalBytes)), free \(Fmt.bytes(Int64(free)))")
-        exit(2)
+    // volumeAvailableCapacityForImportantUsage is the better number on APFS —
+    // it counts space macOS would free by evicting purgeable files — but it
+    // reports 0 on exFAT, and exFAT is exactly what a cross-platform archive
+    // drive is formatted as. Taking it at face value refused every import to
+    // one. Fall back to the plain key, and if neither yields a figure, let the
+    // copy proceed and fail on ENOSPC rather than refusing on no evidence.
+    let capacityKeys: Set<URLResourceKey> = [
+        .volumeAvailableCapacityForImportantUsageKey,
+        .volumeAvailableCapacityKey,
+    ]
+    if let v = try? probe.resourceValues(forKeys: capacityKeys) {
+        let important = v.volumeAvailableCapacityForImportantUsage ?? 0
+        let plain = Int64(v.volumeAvailableCapacity ?? 0)
+        let free = important > 0 ? important : plain
+        if free > 0 && free < totalBytes {
+            Term.err("\(Term.red("error:")) not enough space at \(options.destination.path).")
+            Term.err("  need \(Fmt.bytes(totalBytes)), free \(Fmt.bytes(free))")
+            exit(2)
+        }
     }
 }
 
