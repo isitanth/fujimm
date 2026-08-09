@@ -14,6 +14,8 @@ struct Options {
     var verbose = false
     var flat = false
     var includeOther = false
+    /// Overrides the refusal to eject a card that still holds content this run
+    /// did not copy.
     var yes = false
     /// Restores the pre-1.1.0 behaviour of exiting 1 when there is nothing new
     /// to import, for scripts written against it.
@@ -255,6 +257,7 @@ enum OptionsParser {
           --tz <zone>         Timezone for day grouping (default: system)
 
           --eject             Eject the card after a clean import
+          -y, --yes           Eject even when a filter left files on the card
           --fail-on-empty     Exit 1 when there is nothing new to import
                               (the default is 0 — nothing to do is not a failure)
           --json              Machine-readable summary on stdout

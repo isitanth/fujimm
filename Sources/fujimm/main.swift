@@ -403,13 +403,49 @@ for (url, why) in unreadable {
 
 // MARK: - Eject
 
-if options.eject && !options.dryRun && failedCount == 0 && !wasInterrupted {
-    for c in cards where c.isRemovable {
-        if Volumes.eject(c) {
-            if !options.quiet && !options.json { print("Ejected \(c.name).") }
-        } else if !options.quiet {
-            Term.err(Term.yellow("Could not eject \(c.name) — something may still be using it."))
+if options.eject && !options.dryRun {
+    // Eject is the step immediately before a photographer formats the card in
+    // camera, which makes it the highest-consequence decision this tool makes.
+    // The old gate was `failedCount == 0`, which ignored --only, --since,
+    // --until, unreadable folders, and unrecognised types skipped for want of
+    // --other — so `fujimm --only photos --eject` deliberately left every video
+    // on the card and then ejected it.
+    //
+    // Reach Volumes.eject only when the run can account for everything.
+    var leftBehind: [String] = []
+
+    if failedCount > 0 {
+        leftBehind.append("\(failedCount) file\(failedCount == 1 ? "" : "s") failed to copy")
+    }
+    if wasInterrupted {
+        leftBehind.append("the run was interrupted")
+    }
+    let filtered = scans.reduce(0) { $0 + $1.1.skippedByFilter }
+    if filtered > 0 {
+        leftBehind.append("\(filtered) file\(filtered == 1 ? "" : "s") skipped by a filter"
+                          + " (--only, --since/--until, or unrecognised types without --other)")
+    }
+    if !unreadable.isEmpty {
+        leftBehind.append("\(unreadable.count) folder\(unreadable.count == 1 ? "" : "s")"
+                          + " could not be read")
+    }
+
+    if leftBehind.isEmpty || options.yes {
+        if !leftBehind.isEmpty && !options.quiet {
+            Term.err(Term.yellow("Ejecting anyway (--yes) with content still on the card:"))
+            for reason in leftBehind { Term.err(Term.dim("  · \(reason)")) }
         }
+        for c in cards where c.isRemovable {
+            if Volumes.eject(c) {
+                if !options.quiet && !options.json { print("Ejected \(c.name).") }
+            } else if !options.quiet {
+                Term.err(Term.yellow("Could not eject \(c.name) — something may still be using it."))
+            }
+        }
+    } else {
+        Term.err(Term.yellow("Not ejecting — the card still holds content this run did not copy:"))
+        for reason in leftBehind { Term.err(Term.dim("  · \(reason)")) }
+        Term.err(Term.dim("Re-run without the filters to import the rest, or pass -y to eject anyway."))
     }
 }
 
