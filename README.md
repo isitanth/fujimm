@@ -173,11 +173,16 @@ its own.
 
 | Code | Meaning |
 |-----:|---------|
-| `0` | Success |
-| `1` | No card found, or nothing to import |
+| `0` | Success — including when everything was already imported |
+| `1` | No card found (or nothing to import, with `--fail-on-empty`) |
 | `2` | Bad arguments, not enough space, or unsafe destination |
-| `3` | Finished, but some files failed |
+| `3` | Finished, but some files failed or could not be read |
 | `130` | Interrupted with Ctrl-C |
+
+Since 1.1.0, a run that finds nothing new to import exits `0`: a fully-imported
+card is not an error, and `fujimm --json && post-process` should proceed. Pass
+`--fail-on-empty` for the old behaviour. An unreadable folder now exits `3` —
+it means photographs are still on the card.
 
 `--json` prints a single-line machine-readable summary for scripting.
 

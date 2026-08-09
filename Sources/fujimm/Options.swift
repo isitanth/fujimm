@@ -15,6 +15,9 @@ struct Options {
     var flat = false
     var includeOther = false
     var yes = false
+    /// Restores the pre-1.1.0 behaviour of exiting 1 when there is nothing new
+    /// to import, for scripts written against it.
+    var failOnEmpty = false
 
     var dayFormat = "yyyy-MM-dd"
     var photosDirName = "Photos"
@@ -81,6 +84,7 @@ enum OptionsParser {
             case "--verify":         o.verify = true
             case "--overwrite":      o.overwrite = true
             case "--eject":          o.eject = true
+            case "--fail-on-empty":  o.failOnEmpty = true
             case "--json":           o.json = true
             case "-q", "--quiet":    o.quiet = true
             case "-v", "--verbose":  o.verbose = true
@@ -251,6 +255,8 @@ enum OptionsParser {
           --tz <zone>         Timezone for day grouping (default: system)
 
           --eject             Eject the card after a clean import
+          --fail-on-empty     Exit 1 when there is nothing new to import
+                              (the default is 0 — nothing to do is not a failure)
           --json              Machine-readable summary on stdout
       -v, --verbose           Per-file detail, including the date source
       -q, --quiet             Errors only

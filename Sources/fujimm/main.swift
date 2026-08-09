@@ -141,7 +141,7 @@ let totalBytes = allItems.reduce(Int64(0)) { $0 + $1.size }
 
 if allItems.isEmpty {
     if options.json {
-        print(#"{"status":"nothing-to-import","imported":0,"failed":0}"#)
+        print(#"{"schemaVersion":1,"status":"nothing-to-import","imported":0,"failed":0}"#)
     } else {
         print("Nothing to import.")
         for (c, s) in scans where !s.unknownExtensions.isEmpty {
@@ -150,7 +150,12 @@ if allItems.isEmpty {
             print(Term.dim("  \(c.name): unrecognised file types present — \(exts) (use --other to copy them)"))
         }
     }
-    exit(1)
+    // "Everything is already safe" is not a failure. This used to share exit 1
+    // with "I could not find your card", so a launchd job or a shell pipeline
+    // written as `fujimm --json && post-process` treated a fully-imported card
+    // as an error. --fail-on-empty restores the old behaviour for anyone who
+    // was relying on it.
+    exit(options.failOnEmpty ? 1 : 0)
 }
 
 // MARK: - Plan
@@ -338,7 +343,8 @@ if options.json {
         .map { "\(jsonString($0.key)):\($0.value)" }
     print("""
     {"schemaVersion":1,\
-    "status":\(jsonString(wasInterrupted ? "interrupted" : (failedCount > 0 ? "partial" : "ok"))),\
+    "status":\(jsonString(wasInterrupted ? "interrupted"
+                          : (failedCount > 0 || !unreadable.isEmpty ? "partial" : "ok"))),\
     "dryRun":\(options.dryRun),\
     "destination":\(jsonString(options.destination.path)),\
     "days":[\(days.map { jsonString($0) }.joined(separator: ","))],\
@@ -408,7 +414,12 @@ if options.eject && !options.dryRun && failedCount == 0 && !wasInterrupted {
 }
 
 if wasInterrupted { exit(130) }
-exit(failedCount > 0 ? 3 : 0)
+
+// An unreadable directory means photographs are still on the card. Scanner
+// collects those into ScanResult.unreadable and keeps walking, but they never
+// became MediaItems, never became CopyRecords, and so never reached
+// failedCount — an entire unreadable DCIM subfolder used to yield exit 0.
+exit(failedCount > 0 || !unreadable.isEmpty ? 3 : 0)
 
 // MARK: - Helpers
 
