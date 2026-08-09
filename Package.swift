@@ -17,6 +17,15 @@ let package = Package(
                 .linkedFramework("CoreServices"),
                 .linkedFramework("DiskArbitration"),
             ]
-        )
+        ),
+        // The import policy under test lives in main.swift's top-level statements,
+        // which are unreachable from a test host, so these tests drive the built
+        // binary as a subprocess. The dependency exists to make `swift test` build
+        // it. No library split is needed for this.
+        .testTarget(
+            name: "fujimmTests",
+            dependencies: ["fujimm"],
+            path: "Tests/fujimmTests"
+        ),
     ]
 )

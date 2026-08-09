@@ -103,10 +103,18 @@ if options.listOnly {
 // MARK: - Safety: don't import a card into itself
 
 for c in cards {
-    let dest = options.destination.standardizedFileURL.path
-    let src = c.volumeURL.standardizedFileURL.path
-    if dest == src || dest.hasPrefix(src.hasSuffix("/") ? src : src + "/") {
-        Term.err("\(Term.red("error:")) destination is on the card itself (\(dest)).")
+    // Containment, not volume identity. For a real card the two coincide, but
+    // `--source ~/old-offload` makes the "card" a folder on the user's own
+    // disk, where the destination is legitimately on the same volume — the
+    // advertised re-sort workflow. What must be refused is a destination inside
+    // the source tree.
+    //
+    // isContained resolves symlinks and case through realpath, so it also
+    // closes the three defects in the string comparison this replaces. It fails
+    // closed, which for a refusal check means an undeterminable answer allows
+    // the import; every individual write is containment-checked regardless.
+    if PathSafety.isContained(options.destination.path, in: c.volumeURL.path) {
+        Term.err("\(Term.red("error:")) destination is inside the card (\(options.destination.path)).")
         Term.err("Choose a destination on your Mac with --dest.")
         exit(2)
     }
@@ -133,7 +141,7 @@ let totalBytes = allItems.reduce(Int64(0)) { $0 + $1.size }
 
 if allItems.isEmpty {
     if options.json {
-        print(#"{"status":"nothing-to-import","imported":0,"failed":0}"#)
+        print(#"{"schemaVersion":1,"status":"nothing-to-import","imported":0,"failed":0}"#)
     } else {
         print("Nothing to import.")
         for (c, s) in scans where !s.unknownExtensions.isEmpty {
@@ -142,7 +150,12 @@ if allItems.isEmpty {
             print(Term.dim("  \(c.name): unrecognised file types present — \(exts) (use --other to copy them)"))
         }
     }
-    exit(1)
+    // "Everything is already safe" is not a failure. This used to share exit 1
+    // with "I could not find your card", so a launchd job or a shell pipeline
+    // written as `fujimm --json && post-process` treated a fully-imported card
+    // as an error. --fail-on-empty restores the old behaviour for anyone who
+    // was relying on it.
+    exit(options.failOnEmpty ? 1 : 0)
 }
 
 // MARK: - Plan
@@ -194,9 +207,9 @@ if !options.quiet && !options.json {
             print(Term.yellow("  not importing unrecognised types: ") + exts
                   + Term.dim("  (use --other to include them)"))
         }
-        for (url, why) in s.unreadable {
-            print(Term.yellow("  unreadable: ") + url.lastPathComponent + Term.dim(" — \(why)"))
-        }
+        // Unreadable entries are reported once, on stderr, after the run — see
+        // the failure block at the end. Printing them here too would duplicate
+        // them in text mode.
     }
 }
 
@@ -207,12 +220,25 @@ if !options.dryRun {
     let probe = FileManager.default.fileExists(atPath: destParent.path)
         ? destParent
         : destParent.deletingLastPathComponent()
-    if let v = try? probe.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-       let free = v.volumeAvailableCapacityForImportantUsage,
-       free < totalBytes {
-        Term.err("\(Term.red("error:")) not enough space at \(options.destination.path).")
-        Term.err("  need \(Fmt.bytes(totalBytes)), free \(Fmt.bytes(Int64(free)))")
-        exit(2)
+    // volumeAvailableCapacityForImportantUsage is the better number on APFS —
+    // it counts space macOS would free by evicting purgeable files — but it
+    // reports 0 on exFAT, and exFAT is exactly what a cross-platform archive
+    // drive is formatted as. Taking it at face value refused every import to
+    // one. Fall back to the plain key, and if neither yields a figure, let the
+    // copy proceed and fail on ENOSPC rather than refusing on no evidence.
+    let capacityKeys: Set<URLResourceKey> = [
+        .volumeAvailableCapacityForImportantUsageKey,
+        .volumeAvailableCapacityKey,
+    ]
+    if let v = try? probe.resourceValues(forKeys: capacityKeys) {
+        let important = v.volumeAvailableCapacityForImportantUsage ?? 0
+        let plain = Int64(v.volumeAvailableCapacity ?? 0)
+        let free = important > 0 ? important : plain
+        if free > 0 && free < totalBytes {
+            Term.err("\(Term.red("error:")) not enough space at \(options.destination.path).")
+            Term.err("  need \(Fmt.bytes(totalBytes)), free \(Fmt.bytes(free))")
+            exit(2)
+        }
     }
 }
 
@@ -258,12 +284,13 @@ for (index, item) in allItems.enumerated() {
     records.append(record)
 
     switch record.outcome {
-    case .copied(let b), .overwritten(let b):
+    // A renamed file was written in full — its bytes belong in the total, the
+    // throughput figure and the JSON just as much as a plain copy's.
+    case .copied(let b), .overwritten(let b), .renamed(_, let b):
         copiedBytes += b
-    case .skippedIdentical, .renamed, .wouldCopy:
-        // Renamed/skipped items still advance the byte counter for ETA purposes.
-        if case .skippedIdentical = record.outcome { doneBytes += item.size }
-        if case .wouldCopy = record.outcome { doneBytes += item.size }
+    case .skippedIdentical, .wouldCopy:
+        // Skipped and planned items still advance the byte counter for ETA purposes.
+        doneBytes += item.size
     case .failed, .interrupted:
         break
     }
@@ -295,10 +322,29 @@ for r in records {
 
 let wasInterrupted = copier.interrupted
 
+// Everything the run did NOT copy. These were previously reachable only in text
+// mode: a scripted `fujimm --json` saw {"status":"ok"} for a run that left an
+// unreadable folder full of photographs on the card.
+let unreadable = scans.flatMap { $0.1.unreadable }
+let unknownExtensions = scans.reduce(into: [String: Int]()) { acc, entry in
+    for (ext, n) in entry.1.unknownExtensions { acc[ext, default: 0] += n }
+}
+
 if options.json {
     let days = Set(allItems.map { $0.date.day }).sorted()
+    let failureObjects = failures.map { r -> String in
+        guard case .failed(let why) = r.outcome else { return "{}" }
+        return "{\"path\":\(jsonString(r.item.source.path)),\"reason\":\(jsonString(why))}"
+    }
+    let unreadableObjects = unreadable.map {
+        "{\"path\":\(jsonString($0.0.path)),\"reason\":\(jsonString($0.1))}"
+    }
+    let unknownObjects = unknownExtensions.sorted { $0.key < $1.key }
+        .map { "\(jsonString($0.key)):\($0.value)" }
     print("""
-    {"status":\(jsonString(wasInterrupted ? "interrupted" : (failedCount > 0 ? "partial" : "ok"))),\
+    {"schemaVersion":1,\
+    "status":\(jsonString(wasInterrupted ? "interrupted"
+                          : (failedCount > 0 || !unreadable.isEmpty ? "partial" : "ok"))),\
     "dryRun":\(options.dryRun),\
     "destination":\(jsonString(options.destination.path)),\
     "days":[\(days.map { jsonString($0) }.joined(separator: ","))],\
@@ -306,6 +352,9 @@ if options.json {
     "copied":\(copiedCount),"renamed":\(renamedCount),"skipped":\(skippedCount),\
     "planned":\(plannedCount),"failed":\(failedCount),\
     "bytes":\(copiedBytes),"plannedBytes":\(plannedBytes),\
+    "failures":[\(failureObjects.joined(separator: ","))],\
+    "unreadable":[\(unreadableObjects.joined(separator: ","))],\
+    "unknownExtensions":{\(unknownObjects.joined(separator: ","))},\
     "seconds":\(String(format: "%.2f", elapsed))}
     """)
 } else if !options.quiet {
@@ -314,7 +363,16 @@ if options.json {
         print(Term.bold("Dry run — nothing was copied."))
         print("  would copy    \(plannedCount) file\(plannedCount == 1 ? "" : "s")  (\(Fmt.bytes(plannedBytes)))")
         if skippedCount > 0 { print("  already there \(skippedCount)") }
-        if renamedCount > 0 { print("  name clashes  \(renamedCount) (\(Fmt.bytes(renamedBytes)), would be saved with a -1 suffix)") }
+        if renamedCount > 0 {
+            // Not a hardcoded "-1": the fourth collision on a name lands as -4,
+            // and saying otherwise made the dry run mispredict the real run.
+            let example = records.compactMap { r -> String? in
+                if case .renamed(let to, _) = r.outcome { return to }
+                return nil
+            }.first
+            let suffix = example.map { ", e.g. \($0)" } ?? ""
+            print("  name clashes  \(renamedCount) (\(Fmt.bytes(renamedBytes)), kept alongside\(suffix))")
+        }
     } else {
         if wasInterrupted {
             print(Term.yellow("Interrupted — the partial file was removed. Re-run to resume."))
@@ -327,30 +385,77 @@ if options.json {
         print("  destination   \(Term.cyan(options.destination.path))")
     }
 
-    for r in failures {
-        if case .failed(let why) = r.outcome {
-            print(Term.red("  ✗ ") + r.item.relativeDestination + Term.dim(" — \(why)"))
-        }
-    }
-
     print("")
     print(Term.dim("The card was not modified."))
 }
 
+// On stderr, and in every output mode. `--help` describes --quiet as "errors
+// only", and a scripted --json run that left photographs behind must not look
+// like a clean one. stderr keeps it out of the JSON a caller is parsing.
+for r in failures {
+    if case .failed(let why) = r.outcome {
+        Term.err(Term.red("  ✗ ") + r.item.relativeDestination + Term.dim(" — \(why)"))
+    }
+}
+for (url, why) in unreadable {
+    Term.err(Term.yellow("  unreadable: ") + url.path + Term.dim(" — \(why)"))
+}
+
 // MARK: - Eject
 
-if options.eject && !options.dryRun && failedCount == 0 && !wasInterrupted {
-    for c in cards where c.isRemovable {
-        if Volumes.eject(c) {
-            if !options.quiet && !options.json { print("Ejected \(c.name).") }
-        } else if !options.quiet {
-            Term.err(Term.yellow("Could not eject \(c.name) — something may still be using it."))
+if options.eject && !options.dryRun {
+    // Eject is the step immediately before a photographer formats the card in
+    // camera, which makes it the highest-consequence decision this tool makes.
+    // The old gate was `failedCount == 0`, which ignored --only, --since,
+    // --until, unreadable folders, and unrecognised types skipped for want of
+    // --other — so `fujimm --only photos --eject` deliberately left every video
+    // on the card and then ejected it.
+    //
+    // Reach Volumes.eject only when the run can account for everything.
+    var leftBehind: [String] = []
+
+    if failedCount > 0 {
+        leftBehind.append("\(failedCount) file\(failedCount == 1 ? "" : "s") failed to copy")
+    }
+    if wasInterrupted {
+        leftBehind.append("the run was interrupted")
+    }
+    let filtered = scans.reduce(0) { $0 + $1.1.skippedByFilter }
+    if filtered > 0 {
+        leftBehind.append("\(filtered) file\(filtered == 1 ? "" : "s") skipped by a filter"
+                          + " (--only, --since/--until, or unrecognised types without --other)")
+    }
+    if !unreadable.isEmpty {
+        leftBehind.append("\(unreadable.count) folder\(unreadable.count == 1 ? "" : "s")"
+                          + " could not be read")
+    }
+
+    if leftBehind.isEmpty || options.yes {
+        if !leftBehind.isEmpty && !options.quiet {
+            Term.err(Term.yellow("Ejecting anyway (--yes) with content still on the card:"))
+            for reason in leftBehind { Term.err(Term.dim("  · \(reason)")) }
         }
+        for c in cards where c.isRemovable {
+            if Volumes.eject(c) {
+                if !options.quiet && !options.json { print("Ejected \(c.name).") }
+            } else if !options.quiet {
+                Term.err(Term.yellow("Could not eject \(c.name) — something may still be using it."))
+            }
+        }
+    } else {
+        Term.err(Term.yellow("Not ejecting — the card still holds content this run did not copy:"))
+        for reason in leftBehind { Term.err(Term.dim("  · \(reason)")) }
+        Term.err(Term.dim("Re-run without the filters to import the rest, or pass -y to eject anyway."))
     }
 }
 
 if wasInterrupted { exit(130) }
-exit(failedCount > 0 ? 3 : 0)
+
+// An unreadable directory means photographs are still on the card. Scanner
+// collects those into ScanResult.unreadable and keeps walking, but they never
+// became MediaItems, never became CopyRecords, and so never reached
+// failedCount — an entire unreadable DCIM subfolder used to yield exit 0.
+exit(failedCount > 0 || !unreadable.isEmpty ? 3 : 0)
 
 // MARK: - Helpers
 
@@ -386,7 +491,7 @@ func describe(_ r: CopyRecord) -> String {
         return "  \(Term.yellow("↻")) \(r.item.relativeDestination)  \(Fmt.bytes(b)) overwritten \(src)"
     case .skippedIdentical:
         return "  \(Term.dim("·")) \(r.item.relativeDestination)  \(Term.dim("already imported"))"
-    case .renamed(let to):
+    case .renamed(let to, _):
         return "  \(Term.yellow("+")) \(r.item.relativeDestination)  \(Term.dim("saved as \(to)"))"
     case .wouldCopy:
         return "  \(Term.dim("→")) \(r.item.relativeDestination)  \(Fmt.bytes(r.item.size)) \(src)"

@@ -1,0 +1,50 @@
+name: CI
+
+# The tool's central claim is that it does not lose photographs. That claim is
+# carried by Tests/fujimmTests, so it needs to hold somewhere other than the
+# author's Mac.
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+  pull_request:
+
+# A second push to the same branch makes the earlier run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build and test
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+          sw_vers
+
+      # Release config as well as debug: the shipped binary is the one built
+      # with optimisations, and it is the one users install.
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Test
+        run: swift test
+
+      # The tests drive the built binary as a subprocess against synthetic
+      # fixture cards. If a fixture leaks into the destination or the card tree
+      # is modified, the assertions catch it — but a crashed binary can leave a
+      # partial tree behind, so surface anything unexpected in the workspace.
+      - name: Working tree is clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the build or test run left files behind"
+            git status --porcelain
+            exit 1
+          fi

@@ -36,7 +36,7 @@ enum Formats {
         "MOV", "QT",
         "MP4", "M4V",
         "AVI",
-        "MTS", "M2TS", "MTS2",
+        "MTS", "M2TS",
         "3GP", "3G2",
         "MPG", "MPEG",
         "MKV",

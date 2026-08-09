@@ -14,7 +14,12 @@ struct Options {
     var verbose = false
     var flat = false
     var includeOther = false
+    /// Overrides the refusal to eject a card that still holds content this run
+    /// did not copy.
     var yes = false
+    /// Restores the pre-1.1.0 behaviour of exiting 1 when there is nothing new
+    /// to import, for scripts written against it.
+    var failOnEmpty = false
 
     var dayFormat = "yyyy-MM-dd"
     var photosDirName = "Photos"
@@ -33,7 +38,7 @@ struct Options {
         return docs.appendingPathComponent("Fujifilm")
     }
 
-    static let version = "1.0.0"
+    static let version = "1.1.0"
 }
 
 enum OptionsError: Error {
@@ -61,8 +66,15 @@ enum OptionsParser {
             case "--version":        throw OptionsError.versionRequested
 
             case "-d", "--dest", "--destination":
+                let raw = try next(arg)
+                // An unset shell variable turns `--dest "$DEST"` into `--dest ""`,
+                // which Foundation resolves to the current directory — so a script
+                // with a typo quietly imports 20 GB into wherever it was run.
+                guard !raw.trimmingCharacters(in: .whitespaces).isEmpty else {
+                    throw OptionsError.usage("\(arg) needs a path")
+                }
                 o.destination = URL(
-                    fileURLWithPath: (try next(arg) as NSString).expandingTildeInPath
+                    fileURLWithPath: (raw as NSString).expandingTildeInPath
                 ).standardizedFileURL
 
             case "-s", "--source":
@@ -74,6 +86,7 @@ enum OptionsParser {
             case "--verify":         o.verify = true
             case "--overwrite":      o.overwrite = true
             case "--eject":          o.eject = true
+            case "--fail-on-empty":  o.failOnEmpty = true
             case "--json":           o.json = true
             case "-q", "--quiet":    o.quiet = true
             case "-v", "--verbose":  o.verbose = true
@@ -81,10 +94,10 @@ enum OptionsParser {
             case "--other":          o.includeOther = true
             case "-y", "--yes":      o.yes = true
 
-            case "--date-format":    o.dayFormat = try next(arg)
-            case "--photos-dir":     o.photosDirName = try next(arg)
-            case "--videos-dir":     o.videosDirName = try next(arg)
-            case "--other-dir":      o.otherDirName = try next(arg)
+            case "--date-format":    o.dayFormat = try dayFormat(try next(arg), flag: arg)
+            case "--photos-dir":     o.photosDirName = try bucket(try next(arg), flag: arg)
+            case "--videos-dir":     o.videosDirName = try bucket(try next(arg), flag: arg)
+            case "--other-dir":      o.otherDirName = try bucket(try next(arg), flag: arg)
 
             case "--only":
                 let v = try next(arg).lowercased()
@@ -144,6 +157,46 @@ enum OptionsParser {
         return o
     }
 
+    /// A bucket name is interpolated straight into the per-item relative path,
+    /// so `..` in it walks the destination out of the directory the user named —
+    /// including back onto the card, while the run still prints "The card was
+    /// not modified."
+    ///
+    /// `/` is allowed on purpose: `--photos-dir 'Raw/Fuji'` nests a bucket and
+    /// works today. Only `..` escapes.
+    private static func bucket(_ name: String, flag: String) throws -> String {
+        guard !name.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw OptionsError.usage("\(flag) needs a folder name")
+        }
+        guard !PathSafety.containsUpwardComponent(name) else {
+            throw OptionsError.usage("\(flag) cannot contain a '..' path component — got '\(name)'")
+        }
+        return name
+    }
+
+    /// DateFormatter passes `.` and `/` through as literals, so `--date-format
+    /// '../..'` needs no quoting at all to escape the destination.
+    ///
+    /// The check has to be on the *output*, not the pattern: a quoted literal
+    /// smuggles `..` past any inspection of the pattern itself — `yyyy'/../'MM`
+    /// formats to `2026/../06`.
+    private static func dayFormat(_ pattern: String, flag: String) throws -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = pattern
+        let rendered = f.string(from: Date(timeIntervalSince1970: 1_781_524_800))
+
+        guard !rendered.isEmpty else {
+            throw OptionsError.usage("\(flag) '\(pattern)' produces an empty folder name")
+        }
+        guard !PathSafety.containsUpwardComponent(rendered) else {
+            throw OptionsError.usage(
+                "\(flag) '\(pattern)' produces '\(rendered)', which contains a '..' path component"
+            )
+        }
+        return pattern
+    }
+
     private static func parseDay(_ s: String, endOfDay: Bool, tz: TimeZone) throws -> Date {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -178,7 +231,8 @@ enum OptionsParser {
           Videos/ …
 
     \(Term.bold("OPTIONS"))
-      -d, --dest <path>       Destination root
+      -d, --dest, --destination <path>
+                              Destination root
                               (default: ~/Documents/Fujifilm)
       -s, --source <path>     Import from this volume or folder instead of
                               auto-detecting. Repeatable.
@@ -194,6 +248,7 @@ enum OptionsParser {
                               Examples: 'yyyy/MM/dd', 'yyyy-MM-dd EEEE'
           --photos-dir <name> Rename the Photos subfolder (default Photos)
           --videos-dir <name> Rename the Videos subfolder (default Videos)
+          --other-dir <name>  Rename the Other subfolder (default Other)
           --flat              No Photos/Videos split — one folder per day
           --other             Also copy unrecognised file types into Other/
 
@@ -201,9 +256,16 @@ enum OptionsParser {
           --overwrite         Replace same-named files that differ
                               (default: keep both, adding -1, -2, …)
           --video-date <src>  'mtime' (default) or 'quicktime'
-          --tz <zone>         Timezone for day grouping (default: system)
+          --tz, --timezone <zone>
+                              Timezone for videos and --since/--until
+                              (default: system). Stills always use the
+                              camera's literal EXIF date, so this cannot
+                              move them.
 
           --eject             Eject the card after a clean import
+          -y, --yes           Eject even when a filter left files on the card
+          --fail-on-empty     Exit 1 when there is nothing new to import
+                              (the default is 0 — nothing to do is not a failure)
           --json              Machine-readable summary on stdout
       -v, --verbose           Per-file detail, including the date source
       -q, --quiet             Errors only
