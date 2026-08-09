@@ -61,8 +61,15 @@ enum OptionsParser {
             case "--version":        throw OptionsError.versionRequested
 
             case "-d", "--dest", "--destination":
+                let raw = try next(arg)
+                // An unset shell variable turns `--dest "$DEST"` into `--dest ""`,
+                // which Foundation resolves to the current directory — so a script
+                // with a typo quietly imports 20 GB into wherever it was run.
+                guard !raw.trimmingCharacters(in: .whitespaces).isEmpty else {
+                    throw OptionsError.usage("\(arg) needs a path")
+                }
                 o.destination = URL(
-                    fileURLWithPath: (try next(arg) as NSString).expandingTildeInPath
+                    fileURLWithPath: (raw as NSString).expandingTildeInPath
                 ).standardizedFileURL
 
             case "-s", "--source":
@@ -81,10 +88,10 @@ enum OptionsParser {
             case "--other":          o.includeOther = true
             case "-y", "--yes":      o.yes = true
 
-            case "--date-format":    o.dayFormat = try next(arg)
-            case "--photos-dir":     o.photosDirName = try next(arg)
-            case "--videos-dir":     o.videosDirName = try next(arg)
-            case "--other-dir":      o.otherDirName = try next(arg)
+            case "--date-format":    o.dayFormat = try dayFormat(try next(arg), flag: arg)
+            case "--photos-dir":     o.photosDirName = try bucket(try next(arg), flag: arg)
+            case "--videos-dir":     o.videosDirName = try bucket(try next(arg), flag: arg)
+            case "--other-dir":      o.otherDirName = try bucket(try next(arg), flag: arg)
 
             case "--only":
                 let v = try next(arg).lowercased()
@@ -142,6 +149,46 @@ enum OptionsParser {
             throw OptionsError.usage("--quiet and --verbose are mutually exclusive")
         }
         return o
+    }
+
+    /// A bucket name is interpolated straight into the per-item relative path,
+    /// so `..` in it walks the destination out of the directory the user named —
+    /// including back onto the card, while the run still prints "The card was
+    /// not modified."
+    ///
+    /// `/` is allowed on purpose: `--photos-dir 'Raw/Fuji'` nests a bucket and
+    /// works today. Only `..` escapes.
+    private static func bucket(_ name: String, flag: String) throws -> String {
+        guard !name.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw OptionsError.usage("\(flag) needs a folder name")
+        }
+        guard !PathSafety.containsUpwardComponent(name) else {
+            throw OptionsError.usage("\(flag) cannot contain a '..' path component — got '\(name)'")
+        }
+        return name
+    }
+
+    /// DateFormatter passes `.` and `/` through as literals, so `--date-format
+    /// '../..'` needs no quoting at all to escape the destination.
+    ///
+    /// The check has to be on the *output*, not the pattern: a quoted literal
+    /// smuggles `..` past any inspection of the pattern itself — `yyyy'/../'MM`
+    /// formats to `2026/../06`.
+    private static func dayFormat(_ pattern: String, flag: String) throws -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = pattern
+        let rendered = f.string(from: Date(timeIntervalSince1970: 1_781_524_800))
+
+        guard !rendered.isEmpty else {
+            throw OptionsError.usage("\(flag) '\(pattern)' produces an empty folder name")
+        }
+        guard !PathSafety.containsUpwardComponent(rendered) else {
+            throw OptionsError.usage(
+                "\(flag) '\(pattern)' produces '\(rendered)', which contains a '..' path component"
+            )
+        }
+        return pattern
     }
 
     private static func parseDay(_ s: String, endOfDay: Bool, tz: TimeZone) throws -> Date {

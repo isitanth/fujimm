@@ -270,25 +270,69 @@ cannot diverge by construction.
 
 ### Commit 5 — destination containment
 
-One helper, used in both places — `fix-path-escape` and `fix-dest-guard` are the same problem
-at two altitudes, and splitting them means writing symlink resolution and case-insensitive
-comparison twice.
+> **Revised after measurement.** The prescription originally written here was wrong in two
+> ways and incomplete in a third. What follows replaces it; every claim below was verified by
+> running code on this machine (macOS 26, Swift 6.3.3).
 
+`fix-path-escape` and `fix-dest-guard` are the same problem at two altitudes, so they share
+one helper.
+
+**What the original spec got wrong.**
+
+1. *"Compare symlink-resolved paths"* — `URL.resolvingSymlinksInPath()` is **all-or-nothing**.
+   If the full path does not exist it resolves nothing, not even leading components that exist
+   and are themselves symlinks. A destination that does not exist yet is the normal case for a
+   first import, so that guard would have done nothing on the path it was written to protect.
+   It also maps `/private/tmp` → `/tmp` while `realpath` maps `/tmp` → `/private/tmp`, so
+   mixing the two guarantees a mismatch under `/tmp` and `/var/folders` — where
+   `NSTemporaryDirectory()`, and therefore the test suite, lives.
+2. *"Case-insensitive comparison"* — unnecessary, and lowercasing would be wrong in both
+   directions (it equates distinct files on a case-sensitive volume and ignores Unicode
+   normalisation). `realpath(3)` returns the on-disk spelling of every component, so its
+   output compares correctly with `==` on case-sensitive and case-insensitive volumes alike.
+3. **Missing:** `FileManager.createDirectory(withIntermediateDirectories: true)` **follows a
+   symlink out of the destination root.** Demonstrated: a symlink at `<dest>/broken` pointing
+   outside, plus a request for `<dest>/broken/sub`, writes outside `<dest>`. A containment
+   check placed before the write does not stop this, because the write itself does the
+   escaping.
+
+**What to build.**
+
+- **A `PathSafety` helper** (new file, `Sources/fujimm/PathSafety.swift`), zero dependencies:
+  - `canonical(_:)` — `realpath(3)`. Resolves symlinks, `..`, `.`, and case. Requires existence.
+  - `deepestExisting(_:)` — walks up until `canonical` succeeds, returning the resolved
+    ancestor plus the not-yet-existing tail. Terminate on `parent.path == url.path`, which is
+    a fixed point for paths ending in `..` and so fails those closed.
+  - `path(_:isInsideOrEqualTo:)` — **fails closed.** Compares component arrays of canonical
+    paths, never `hasPrefix` (`"/a/bc".hasPrefix("/a/b")` is `true`), then confirms with
+    `st_dev`+`st_ino` identity of the ancestor taken at the root's depth. Any doubt → `false`
+    → refuse the item.
+  - `onSameVolume(_:_:)` — **fails open**, returning `Bool?`. Primary signal
+    `.volumeIdentifierKey` on the deepest existing ancestor (it throws for non-existent paths,
+    and it correctly treats the firmlinked system/data pair as one volume); fallback
+    `statfs().f_mntonname`; `nil` when undeterminable.
+  - `createDirectoryChain(root:tail:)` — `mkdir(2)` one component at a time, requiring `lstat`
+    to report a real directory on `EEXIST`. Replaces `createDirectory(withIntermediateDirectories:)`
+    on the copy path.
 - **Parse time** (`Options.swift`): reject a bucket name that is empty, `.`, `..`, or contains
-  `/`. Reject an empty or whitespace-only `--dest`. Reject a `--date-format` producing a `..`
-  component.
-- **Card guard** (`main.swift:105-113`): compare symlink-resolved paths, and check volume
-  identity (`URLResourceKey.volumeIdentifierKey`) as the primary signal with the path prefix
-  as a cheap fallback. Today's comparison is case-sensitive while APFS and exFAT default to
-  case-insensitive.
-- **Immediately before `open`** (`Copier.swift:42`): assert the composed destination is
-  contained by the destination root. This catches anything a future flag introduces.
+  `/`. Reject an empty or whitespace-only `--dest`. For `--date-format`, format a date and
+  reject the **output** if any `/`-separated component is `..` — not the pattern, because
+  `yyyy'/../'MM` smuggles `..` through a quoted literal and produces `2026/../06`.
+- **Card guard** (`main.swift:105-113`): `PathSafety.onSameVolume(...) == true`. The `== true`
+  is deliberate: `nil` allows the import rather than blocking a legitimate one.
+- **Before the write** (`Copier.swift:42`): assert containment, and add `O_NOFOLLOW` to the
+  temp-file `open` to close the check-to-open window.
 
-Keep the documented `--date-format 'yyyy/MM/dd'` nested-folder behaviour working — only `..`
-components are rejected. Add a test for it.
+**What must keep working.** `--date-format 'yyyy/MM/dd'` produces components
+`["2026","06","15"]` — no `..` — so the documented nested-folder behaviour survives a rule
+that rejects only `..` components. Measured, not assumed. A rule rejecting `/` would break it.
+
+**Not a threat.** A filename read off a card cannot contain `/` or be `..`: the filesystem
+refuses to create either. Verified. The filename needs no sanitising.
 
 *Verify:* reproduction #3 flips — `--photos-dir '../../escape/PWNED'` exits 2 instead of
-writing outside `--dest`. Nested date format still produces nested folders.
+writing outside `--dest`. Nested date format still nests. The symlink-in-the-path escape is
+refused.
 
 ### Commit 6 — reporting truth
 

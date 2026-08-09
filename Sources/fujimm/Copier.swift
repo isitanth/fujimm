@@ -80,12 +80,24 @@ final class Copier {
             return CopyRecord(item: item, outcome: .wouldCopy, destination: dest)
         }
 
-        do {
-            try fm.createDirectory(at: dest.deletingLastPathComponent(),
-                                   withIntermediateDirectories: true)
-        } catch {
+        // Last line of defence before anything is written. The flags that compose
+        // this path are validated at parse time, but this catches whatever a
+        // future flag introduces, and it is the only check that sees the fully
+        // composed path.
+        guard PathSafety.isContained(dest.path, in: root.path) else {
+            return CopyRecord(
+                item: item,
+                outcome: .failed("refusing to write outside \(root.path)"),
+                destination: dest
+            )
+        }
+
+        // Not FileManager.createDirectory(withIntermediateDirectories:): that
+        // follows a symlink, so one planted inside the destination sends the
+        // write outside it — after containment has already passed.
+        guard PathSafety.createDirectoryChain(at: dest.deletingLastPathComponent().path) else {
             return CopyRecord(item: item,
-                              outcome: .failed("cannot create folder: \(error.localizedDescription)"),
+                              outcome: .failed("cannot create folder for \(item.filename)"),
                               destination: dest)
         }
 
@@ -186,7 +198,10 @@ final class Copier {
         _ = fcntl(inFD, F_NOCACHE, 1)
         _ = fcntl(inFD, F_RDAHEAD, 1)
 
-        let outFD = open(dst.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        // O_NOFOLLOW closes the window between the containment check and this
+        // open: if a symlink has appeared at the temp path since, refuse rather
+        // than write through it.
+        let outFD = open(dst.path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o644)
         guard outFD >= 0 else { return .failure("cannot create copy: \(errnoText())") }
         defer { close(outFD) }
 

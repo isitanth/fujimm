@@ -103,10 +103,18 @@ if options.listOnly {
 // MARK: - Safety: don't import a card into itself
 
 for c in cards {
-    let dest = options.destination.standardizedFileURL.path
-    let src = c.volumeURL.standardizedFileURL.path
-    if dest == src || dest.hasPrefix(src.hasSuffix("/") ? src : src + "/") {
-        Term.err("\(Term.red("error:")) destination is on the card itself (\(dest)).")
+    // Containment, not volume identity. For a real card the two coincide, but
+    // `--source ~/old-offload` makes the "card" a folder on the user's own
+    // disk, where the destination is legitimately on the same volume — the
+    // advertised re-sort workflow. What must be refused is a destination inside
+    // the source tree.
+    //
+    // isContained resolves symlinks and case through realpath, so it also
+    // closes the three defects in the string comparison this replaces. It fails
+    // closed, which for a refusal check means an undeterminable answer allows
+    // the import; every individual write is containment-checked regardless.
+    if PathSafety.isContained(options.destination.path, in: c.volumeURL.path) {
+        Term.err("\(Term.red("error:")) destination is inside the card (\(options.destination.path)).")
         Term.err("Choose a destination on your Mac with --dest.")
         exit(2)
     }
