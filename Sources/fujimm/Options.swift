@@ -231,7 +231,8 @@ enum OptionsParser {
           Videos/ …
 
     \(Term.bold("OPTIONS"))
-      -d, --dest <path>       Destination root
+      -d, --dest, --destination <path>
+                              Destination root
                               (default: ~/Documents/Fujifilm)
       -s, --source <path>     Import from this volume or folder instead of
                               auto-detecting. Repeatable.
@@ -247,6 +248,7 @@ enum OptionsParser {
                               Examples: 'yyyy/MM/dd', 'yyyy-MM-dd EEEE'
           --photos-dir <name> Rename the Photos subfolder (default Photos)
           --videos-dir <name> Rename the Videos subfolder (default Videos)
+          --other-dir <name>  Rename the Other subfolder (default Other)
           --flat              No Photos/Videos split — one folder per day
           --other             Also copy unrecognised file types into Other/
 
@@ -254,7 +256,11 @@ enum OptionsParser {
           --overwrite         Replace same-named files that differ
                               (default: keep both, adding -1, -2, …)
           --video-date <src>  'mtime' (default) or 'quicktime'
-          --tz <zone>         Timezone for day grouping (default: system)
+          --tz, --timezone <zone>
+                              Timezone for videos and --since/--until
+                              (default: system). Stills always use the
+                              camera's literal EXIF date, so this cannot
+                              move them.
 
           --eject             Eject the card after a clean import
           -y, --yes           Eject even when a filter left files on the card

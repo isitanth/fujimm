@@ -139,7 +139,7 @@ Everything else follows from that:
 
 | | |
 |---|---|
-| **Photos** | `RAF` `JPG` `JPEG` `JPE` `HIF` `HEIF` `HEIC` `TIF` `TIFF` `MPO` `DNG` `PNG` `BMP` `AVIF` `WEBP` |
+| **Photos** | `RAF` `JPG` `JPEG` `JPE` `HIF` `HEIF` `HEIC` `HEICS` `TIF` `TIFF` `MPO` `DNG` `PNG` `BMP` `AVIF` `WEBP` |
 | **Videos** | `MOV` `MP4` `M4V` `AVI` `MTS` `M2TS` `3GP` `3G2` `MPG` `MPEG` `MKV` `QT` |
 | **Sidecars** | `XMP` `THM` `LRV` `AAE` `CTG` — follow whichever file shares their basename |
 
