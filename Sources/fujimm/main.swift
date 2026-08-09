@@ -202,9 +202,9 @@ if !options.quiet && !options.json {
             print(Term.yellow("  not importing unrecognised types: ") + exts
                   + Term.dim("  (use --other to include them)"))
         }
-        for (url, why) in s.unreadable {
-            print(Term.yellow("  unreadable: ") + url.lastPathComponent + Term.dim(" — \(why)"))
-        }
+        // Unreadable entries are reported once, on stderr, after the run — see
+        // the failure block at the end. Printing them here too would duplicate
+        // them in text mode.
     }
 }
 
@@ -279,12 +279,13 @@ for (index, item) in allItems.enumerated() {
     records.append(record)
 
     switch record.outcome {
-    case .copied(let b), .overwritten(let b):
+    // A renamed file was written in full — its bytes belong in the total, the
+    // throughput figure and the JSON just as much as a plain copy's.
+    case .copied(let b), .overwritten(let b), .renamed(_, let b):
         copiedBytes += b
-    case .skippedIdentical, .renamed, .wouldCopy:
-        // Renamed/skipped items still advance the byte counter for ETA purposes.
-        if case .skippedIdentical = record.outcome { doneBytes += item.size }
-        if case .wouldCopy = record.outcome { doneBytes += item.size }
+    case .skippedIdentical, .wouldCopy:
+        // Skipped and planned items still advance the byte counter for ETA purposes.
+        doneBytes += item.size
     case .failed, .interrupted:
         break
     }
@@ -316,10 +317,28 @@ for r in records {
 
 let wasInterrupted = copier.interrupted
 
+// Everything the run did NOT copy. These were previously reachable only in text
+// mode: a scripted `fujimm --json` saw {"status":"ok"} for a run that left an
+// unreadable folder full of photographs on the card.
+let unreadable = scans.flatMap { $0.1.unreadable }
+let unknownExtensions = scans.reduce(into: [String: Int]()) { acc, entry in
+    for (ext, n) in entry.1.unknownExtensions { acc[ext, default: 0] += n }
+}
+
 if options.json {
     let days = Set(allItems.map { $0.date.day }).sorted()
+    let failureObjects = failures.map { r -> String in
+        guard case .failed(let why) = r.outcome else { return "{}" }
+        return "{\"path\":\(jsonString(r.item.source.path)),\"reason\":\(jsonString(why))}"
+    }
+    let unreadableObjects = unreadable.map {
+        "{\"path\":\(jsonString($0.0.path)),\"reason\":\(jsonString($0.1))}"
+    }
+    let unknownObjects = unknownExtensions.sorted { $0.key < $1.key }
+        .map { "\(jsonString($0.key)):\($0.value)" }
     print("""
-    {"status":\(jsonString(wasInterrupted ? "interrupted" : (failedCount > 0 ? "partial" : "ok"))),\
+    {"schemaVersion":1,\
+    "status":\(jsonString(wasInterrupted ? "interrupted" : (failedCount > 0 ? "partial" : "ok"))),\
     "dryRun":\(options.dryRun),\
     "destination":\(jsonString(options.destination.path)),\
     "days":[\(days.map { jsonString($0) }.joined(separator: ","))],\
@@ -327,6 +346,9 @@ if options.json {
     "copied":\(copiedCount),"renamed":\(renamedCount),"skipped":\(skippedCount),\
     "planned":\(plannedCount),"failed":\(failedCount),\
     "bytes":\(copiedBytes),"plannedBytes":\(plannedBytes),\
+    "failures":[\(failureObjects.joined(separator: ","))],\
+    "unreadable":[\(unreadableObjects.joined(separator: ","))],\
+    "unknownExtensions":{\(unknownObjects.joined(separator: ","))},\
     "seconds":\(String(format: "%.2f", elapsed))}
     """)
 } else if !options.quiet {
@@ -335,7 +357,16 @@ if options.json {
         print(Term.bold("Dry run — nothing was copied."))
         print("  would copy    \(plannedCount) file\(plannedCount == 1 ? "" : "s")  (\(Fmt.bytes(plannedBytes)))")
         if skippedCount > 0 { print("  already there \(skippedCount)") }
-        if renamedCount > 0 { print("  name clashes  \(renamedCount) (\(Fmt.bytes(renamedBytes)), would be saved with a -1 suffix)") }
+        if renamedCount > 0 {
+            // Not a hardcoded "-1": the fourth collision on a name lands as -4,
+            // and saying otherwise made the dry run mispredict the real run.
+            let example = records.compactMap { r -> String? in
+                if case .renamed(let to, _) = r.outcome { return to }
+                return nil
+            }.first
+            let suffix = example.map { ", e.g. \($0)" } ?? ""
+            print("  name clashes  \(renamedCount) (\(Fmt.bytes(renamedBytes)), kept alongside\(suffix))")
+        }
     } else {
         if wasInterrupted {
             print(Term.yellow("Interrupted — the partial file was removed. Re-run to resume."))
@@ -348,14 +379,20 @@ if options.json {
         print("  destination   \(Term.cyan(options.destination.path))")
     }
 
-    for r in failures {
-        if case .failed(let why) = r.outcome {
-            print(Term.red("  ✗ ") + r.item.relativeDestination + Term.dim(" — \(why)"))
-        }
-    }
-
     print("")
     print(Term.dim("The card was not modified."))
+}
+
+// On stderr, and in every output mode. `--help` describes --quiet as "errors
+// only", and a scripted --json run that left photographs behind must not look
+// like a clean one. stderr keeps it out of the JSON a caller is parsing.
+for r in failures {
+    if case .failed(let why) = r.outcome {
+        Term.err(Term.red("  ✗ ") + r.item.relativeDestination + Term.dim(" — \(why)"))
+    }
+}
+for (url, why) in unreadable {
+    Term.err(Term.yellow("  unreadable: ") + url.path + Term.dim(" — \(why)"))
 }
 
 // MARK: - Eject
@@ -407,7 +444,7 @@ func describe(_ r: CopyRecord) -> String {
         return "  \(Term.yellow("↻")) \(r.item.relativeDestination)  \(Fmt.bytes(b)) overwritten \(src)"
     case .skippedIdentical:
         return "  \(Term.dim("·")) \(r.item.relativeDestination)  \(Term.dim("already imported"))"
-    case .renamed(let to):
+    case .renamed(let to, _):
         return "  \(Term.yellow("+")) \(r.item.relativeDestination)  \(Term.dim("saved as \(to)"))"
     case .wouldCopy:
         return "  \(Term.dim("→")) \(r.item.relativeDestination)  \(Fmt.bytes(r.item.size)) \(src)"

@@ -8,7 +8,9 @@ nonisolated(unsafe) var gInterrupted: sig_atomic_t = 0
 enum CopyOutcome {
     case copied(bytes: Int64)
     case skippedIdentical
-    case renamed(to: String)
+    /// `bytes` is what was actually written — zero for a dry run. Without it the
+    /// summary and the JSON under-report every byte a collision produced.
+    case renamed(to: String, bytes: Int64)
     case overwritten(bytes: Int64)
     case failed(String)
     case wouldCopy          // --dry-run
@@ -74,7 +76,7 @@ final class Copier {
 
         if options.dryRun {
             if didRename {
-                return CopyRecord(item: item, outcome: .renamed(to: dest.lastPathComponent),
+                return CopyRecord(item: item, outcome: .renamed(to: dest.lastPathComponent, bytes: 0),
                                   destination: dest)
             }
             return CopyRecord(item: item, outcome: .wouldCopy, destination: dest)
@@ -173,7 +175,7 @@ final class Copier {
             }
 
             if didOverwrite { return CopyRecord(item: item, outcome: .overwritten(bytes: bytes), destination: dest) }
-            if didRename { return CopyRecord(item: item, outcome: .renamed(to: dest.lastPathComponent), destination: dest) }
+            if didRename { return CopyRecord(item: item, outcome: .renamed(to: dest.lastPathComponent, bytes: bytes), destination: dest) }
             return CopyRecord(item: item, outcome: .copied(bytes: bytes), destination: dest)
         }
     }
