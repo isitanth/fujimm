@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+Minor change fixes.
+
 ## 1.1.0
 
 ### If you are using 1.0.0, please read this
