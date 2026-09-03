@@ -38,6 +38,8 @@ if options.sources.isEmpty {
             Term.err("")
             Term.err("Insert an SD card, or point fujimm at a folder:")
             Term.err("  fujimm --source /path/to/DCIM")
+            Term.err("")
+            Term.err("If a card is inserted but not detected, it may be empty.")
         }
         exit(1)
     }
