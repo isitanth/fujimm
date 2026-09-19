@@ -3,3 +3,11 @@
 *.part
 .claude/settings.local.json
 .swiftpm/
+
+# Generated docs (large binary, regenerated from source)
+*.pdf
+
+# Local working notes
+BACKLOG.md
+NEXT-SESSION.md
+RELEASE-*.md
